@@ -1,10 +1,13 @@
 """Local web server: map in the browser -> STL zip."""
+import json
+import shutil
+import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 import core
 
@@ -25,15 +28,28 @@ def index():
 
 
 @app.post("/build")
-def build(job: Job):  # plain def: FastAPI runs it in a worker thread
-    log = []
+def build(job: str = Form(...), osm: Optional[UploadFile] = File(None)):
+    # plain def: FastAPI runs it in a worker thread
     try:
-        data, n = core.run(job.bbox, job.width_mm, job.leds, bed=job.bed_mm,
-                           log=lambda s: (log.append(s), print(s)))
+        j = Job(**json.loads(job))
+    except (ValueError, ValidationError) as e:
+        raise HTTPException(422, str(e))
+    tmpdir = None
+    try:
+        osm_path = None
+        if osm is not None and osm.filename:
+            tmpdir = tempfile.mkdtemp(prefix="citymap_")
+            osm_path = Path(tmpdir) / Path(osm.filename).name
+            with open(osm_path, "wb") as f:
+                shutil.copyfileobj(osm.file, f)
+        data, n = core.run(j.bbox, j.width_mm, j.leds, bed=j.bed_mm, osm_file=osm_path, log=print)
     except core.BuildError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, f"{type(e).__name__}: {e}")
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
     return Response(data, media_type="application/zip",
                     headers={"Content-Disposition": "attachment; filename=city_map.zip",
                              "X-Pieces": str(n),

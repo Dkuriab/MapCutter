@@ -9,3 +9,5 @@ mapbox_earcut
 manifold3d>=2.4
 fastapi
 uvicorn
+python-multipart
+osmium

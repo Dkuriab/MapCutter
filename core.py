@@ -3,19 +3,14 @@ import io
 import math
 import zipfile
 
-import requests
 import pyproj
 import shapely
 import trimesh
 from shapely.geometry import box, LineString, Point, Polygon, MultiPolygon
 from shapely.ops import unary_union, polygonize, linemerge, transform
-from shapely.affinity import scale as shp_scale, translate, rotate
+from shapely.affinity import scale as shp_scale, translate
 
-OVERPASS_URLS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-]
-USER_AGENT = "CityMap3D/1.0 (personal 3D-print utility)"
+import osm_source
 
 # road width in metres by OSM class
 ROAD_WIDTH = {
@@ -57,30 +52,11 @@ class BuildError(Exception):
 
 # ---------------------------------------------------------------- OSM
 
-def fetch_osm(south, west, north, east):
-    bb = f"({south},{west},{north},{east})"
-    hw = "|".join(sorted(ROAD_WIDTH)) + "|" + "|".join(f"{k}_link" for k in CUT_ROADS)
-    q = f"""
-    [out:json][timeout:120];
-    (
-      way["highway"~"^({hw})$"]{bb};
-      way["waterway"~"^(river|canal|stream|riverbank)$"]{bb};
-      way["natural"="water"]{bb};
-      relation["natural"="water"]{bb};
-      relation["waterway"="riverbank"]{bb};
-    );
-    out geom;
-    """
-    last = None
-    for url in OVERPASS_URLS:
-        try:
-            r = requests.post(url, data={"data": q}, timeout=180,
-                              headers={"User-Agent": USER_AGENT})
-            r.raise_for_status()
-            return r.json()["elements"]
-        except Exception as e:  # try the next mirror
-            last = e
-    raise BuildError(f"Overpass API недоступен: {last}")
+def fetch_osm(south, west, north, east, log=print):
+    try:
+        return osm_source.fetch_online(south, west, north, east, log)
+    except osm_source.SourceError as e:
+        raise BuildError(str(e))
 
 
 def make_projector(lat, lon):
@@ -201,12 +177,13 @@ def split_straight(poly, bed):
 
 
 def make_cells(area, cut_lines, bed):
-    lines = [area.exterior]
-    for l in cut_lines:
-        g = l.intersection(area)
-        if not g.is_empty:
-            lines.append(g)
-    cells = [c for c in polygonize(unary_union(lines)) if c.area > 1]
+    # Do NOT clip the lines to the area first: a clipped end point can miss the
+    # frame by 1e-12 and the cut silently disappears. Node full lines with the
+    # frame and keep the faces that lie inside the area.
+    lines = unary_union([area.exterior] + [l for l in cut_lines if l.intersects(area)])
+    cells = [c for c in polygonize(lines)
+             if c.area > 1 and area.contains(c.representative_point())]
+    cells = [p for c in cells for p in polys(c.intersection(area)) if p.area > 1]
     # polygonize can miss slivers; make sure the cells cover the area
     rest = area.difference(unary_union(cells)) if cells else area
     cells += [p for p in polys(rest) if p.area > 1]
@@ -460,10 +437,25 @@ def check_bbox(bbox_ll):
         raise BuildError(f"Область {km2:.0f} км² слишком большая (максимум {MAX_AREA_KM2})")
 
 
-def run(bbox_ll, model_width_mm, leds_ll=(), bed=256, log=print):
+def run(bbox_ll, model_width_mm, leds_ll=(), bed=256, log=print, osm_file=None):
+    """osm_file: optional path to .osm / .osm.bz2 / .osm.pbf instead of downloading."""
+    try:
+        bbox_ll = osm_source.normalize_bbox(*bbox_ll)
+    except osm_source.SourceError as e:
+        raise BuildError(str(e))
     check_bbox(bbox_ll)
     west, south, east, north = bbox_ll
-    log("Скачиваю OSM…")
-    els = fetch_osm(south, west, north, east)
+    leds_ll = [(lat, osm_source.wrap_lon(lon)) for lat, lon in leds_ll]
+    if osm_file:
+        log(f"Читаю файл {osm_file}…")
+        try:
+            els = osm_source.load_file(osm_file, bbox_ll)
+        except osm_source.SourceError as e:
+            raise BuildError(str(e))
+    else:
+        log("Скачиваю OSM…")
+        els = fetch_osm(south, west, north, east, log)
     log(f"Объектов OSM: {len(els)}")
+    if not els:
+        raise BuildError("В этой области нет ни дорог, ни воды — проверь область или файл")
     return build_from_elements(els, bbox_ll, model_width_mm, leds_ll, bed, log)

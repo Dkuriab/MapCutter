@@ -63,13 +63,116 @@ def test_api(monkeypatch=None):
     try:
         c = TestClient(app.app)
         assert c.get("/").status_code == 200
-        r = c.post("/build", json={"bbox": list(BBOX), "width_mm": 400, "leds": [[55.75, 37.62]]})
+        import json
+        job = lambda **k: {"job": json.dumps(k)}
+        r = c.post("/build", data=job(bbox=list(BBOX), width_mm=400, leds=[[55.75, 37.62]]))
         assert r.status_code == 200, r.text
         assert int(r.headers["X-Pieces"]) >= 2
-        assert c.post("/build", json={"bbox": [37, 55, 38, 56]}).status_code == 400
+        assert c.post("/build", data=job(bbox=[37, 55, 38, 56])).status_code == 400
+        # longitude shifted by a full turn, as Leaflet sends after panning around the globe
+        r = c.post("/build", data=job(bbox=[BBOX[0] + 360, BBOX[1], BBOX[2] + 360, BBOX[3]]))
+        assert r.status_code == 200, r.text
+        # uploaded .osm file instead of downloading
+        r = c.post("/build", data=job(bbox=list(BBOX)),
+                   files={"osm": ("city.osm", to_osm_xml(synthetic()).encode())})
+        assert r.status_code == 200, r.text
     finally:
         core.fetch_osm = orig
 
 
+def to_osm_xml(elements):
+    """synthetic elements -> OSM XML, the way openstreetmap.org Export gives it"""
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', '<osm version="0.6">']
+    nid, wid = [0], [0]
+    nodes, ways, rels = [], [], []
+    def add_way(geom, tags):
+        refs = []
+        for p in geom:
+            nid[0] += 1
+            nodes.append(f'<node id="{nid[0]}" lat="{p["lat"]}" lon="{p["lon"]}"/>')
+            refs.append(nid[0])
+        wid[0] += 1
+        t = "".join(f'<tag k="{k}" v="{v}"/>' for k, v in tags.items())
+        ways.append(f'<way id="{wid[0]}">' + "".join(f'<nd ref="{r}"/>' for r in refs) + t + "</way>")
+        return wid[0]
+    for el in elements:
+        if el["type"] == "way":
+            add_way(el["geometry"], el["tags"])
+        else:
+            mem = [(add_way(m["geometry"], {}), m["role"]) for m in el["members"]]
+            t = "".join(f'<tag k="{k}" v="{v}"/>' for k, v in el["tags"].items())
+            rels.append('<relation id="1">' + "".join(
+                f'<member type="way" ref="{r}" role="{role}"/>' for r, role in mem) + t + "</relation>")
+    # a footpath that must be ignored
+    nodes.append('<node id="999001" lat="55.75" lon="37.61"/><node id="999002" lat="55.76" lon="37.61"/>')
+    ways.append('<way id="999"><nd ref="999001"/><nd ref="999002"/><tag k="highway" v="footway"/></way>')
+    return "\n".join(out + nodes + ways + rels + ["</osm>"])
+
+
+def test_osm_xml_and_pbf(tmp=None):
+    import tempfile, osm_source
+    tmp = tmp or tempfile.mkdtemp()
+    xml_path = os.path.join(tmp, "city.osm")
+    with open(xml_path, "w") as f:
+        f.write(to_osm_xml(synthetic()))
+    els = osm_source.load_file(xml_path)
+    assert len(els) == len(synthetic())  # footway dropped, relation kept
+    assert any(e["type"] == "relation" and len(e["members"]) == 2 for e in els)
+    data, n = core.run(BBOX, 400, osm_file=xml_path, log=lambda *a: None)
+    assert n >= 2
+    try:
+        import osmium
+    except ImportError:
+        return
+    pbf_path = os.path.join(tmp, "city.osm.pbf")
+    if os.path.exists(pbf_path):
+        os.remove(pbf_path)
+    wr = osmium.SimpleWriter(pbf_path)
+    for obj in osmium.FileProcessor(xml_path):
+        wr.add(obj)
+    wr.close()
+    els2 = osm_source.load_file(pbf_path, BBOX)
+    assert len(els2) == len(els), (len(els2), len(els))
+    data, n2 = core.run(BBOX, 400, osm_file=pbf_path, log=lambda *a: None)
+    assert n2 == n
+
+
+def test_fallbacks():
+    """Overpass answers 400 everywhere -> main OSM API is tried; its XML is used."""
+    import osm_source, requests
+    xml = to_osm_xml(synthetic()).encode()
+    calls = []
+    class R:
+        def __init__(self, code, text="", content=b""):
+            self.status_code, self.text, self.content = code, text, content
+    def post(url, **k):
+        calls.append(url); return R(400, "<html><p>Error: line 3: parse error</p></html>")
+    def get(url, **k):
+        calls.append(url); return R(200, content=xml)
+    op, og = requests.post, requests.get
+    requests.post, requests.get = post, get
+    try:
+        els = osm_source.fetch_online(*[BBOX[1], BBOX[0], BBOX[3], BBOX[2]], log=lambda *a: None)
+        assert len(els) == len(synthetic())
+        assert len(calls) == len(osm_source.OVERPASS_URLS) + 1
+        # all sources down -> readable error with the server text and a hint about files
+        requests.get = lambda url, **k: R(509, "Bandwidth exceeded")
+        try:
+            osm_source.fetch_online(*[BBOX[1], BBOX[0], BBOX[3], BBOX[2]], log=lambda *a: None)
+            assert False
+        except osm_source.SourceError as e:
+            assert "parse error" in str(e) and "509" in str(e) and "geofabrik" in str(e)
+    finally:
+        requests.post, requests.get = op, og
+
+
+def test_wrapped_longitude():
+    import osm_source
+    w, s, e, n = osm_source.normalize_bbox(BBOX[0] + 360, BBOX[1], BBOX[2] + 360, BBOX[3])
+    assert abs(w - BBOX[0]) < 1e-9 and abs(e - BBOX[2]) < 1e-9
+    assert "(55.7400000,37.6000000," in osm_source.overpass_query(s, w, n, e)
+
+
 if __name__ == "__main__":
-    test_joints_exist(); test_build(); test_api(); print("OK")
+    test_joints_exist(); test_build(); test_api(); test_osm_xml_and_pbf()
+    test_fallbacks(); test_wrapped_longitude(); print("OK")

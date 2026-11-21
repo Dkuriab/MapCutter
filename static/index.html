@@ -27,6 +27,8 @@
   <span class="sep"></span>
   <label>Ширина модели, мм <input id="w" type="number" value="400" min="50"></label>
   <label>Стол, мм <input id="bed" type="number" value="256" min="100"></label>
+  <label title="Если онлайн-загрузка не работает: .osm (кнопка «Экспорт» на openstreetmap.org) или .osm.pbf (download.geofabrik.de)">Файл карты
+    <input id="osm" type="file" accept=".osm,.pbf,.bz2,.xml" style="width:190px"></label>
   <button id="go">Собрать STL</button>
   <span id="info"></span>
   <span id="st"></span>
@@ -35,7 +37,7 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 const $ = id => document.getElementById(id);
-const map = L.map('map').setView([55.75, 37.62], 13);
+const map = L.map('map', {worldCopyJump: true}).setView([55.75, 37.62], 13);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19, attribution: '&copy; OpenStreetMap'
 }).addTo(map);
@@ -91,17 +93,19 @@ function status(text, err) { $('st').textContent = text; $('st').className = err
 $('go').onclick = async () => {
   if (!rect) { status('Сначала выдели область (кнопка «Область»)', true); return; }
   const b = rect.getBounds();
+  const wrap = x => ((x + 180) % 360 + 360) % 360 - 180;  // Leaflet can give lon > 180
   status('Собираю… это может занять минуту');
   $('go').disabled = true;
   try {
-    const r = await fetch('/build', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        bbox: [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()],
-        width_mm: +$('w').value, bed_mm: +$('bed').value,
-        leds: leds.map(m => [m.getLatLng().lat, m.getLatLng().lng])
-      })
-    });
+    const west = wrap(b.getWest()), east = west + (b.getEast() - b.getWest());
+    const fd = new FormData();
+    fd.append('job', JSON.stringify({
+      bbox: [west, b.getSouth(), east, b.getNorth()],
+      width_mm: +$('w').value, bed_mm: +$('bed').value,
+      leds: leds.map(m => [m.getLatLng().lat, wrap(m.getLatLng().lng)])
+    }));
+    if ($('osm').files[0]) fd.append('osm', $('osm').files[0]);
+    const r = await fetch('/build', {method: 'POST', body: fd});
     if (!r.ok) {
       let msg = r.status;
       try { const j = await r.json(); msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); } catch (_) {}
