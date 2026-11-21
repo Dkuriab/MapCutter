@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>City Map 3D</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { margin: 0; height: 100%; font: 14px -apple-system, BlinkMacSystemFont, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #bar { padding: 8px 10px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; border-bottom: 1px solid #ddd; }
+  #map { flex: 1; }
+  button { padding: 5px 10px; border: 1px solid #aaa; border-radius: 6px; background: #f6f6f6; cursor: pointer; }
+  button.on { background: #2a6df4; color: #fff; border-color: #2a6df4; }
+  button:disabled { opacity: .5; cursor: default; }
+  input { width: 64px; }
+  #st { color: #555; }
+  #st.err { color: #c22; }
+  .sep { width: 1px; height: 22px; background: #ddd; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="mPan" class="on" title="Двигать карту">Карта</button>
+  <button id="mArea" title="Тяни прямоугольник">Область</button>
+  <button id="mLed" title="Клик — поставить точку, клик по точке — убрать">Светодиоды</button>
+  <span class="sep"></span>
+  <label>Ширина модели, мм <input id="w" type="number" value="400" min="50"></label>
+  <label>Стол, мм <input id="bed" type="number" value="256" min="100"></label>
+  <button id="go">Собрать STL</button>
+  <span id="info"></span>
+  <span id="st"></span>
+</div>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const map = L.map('map').setView([55.75, 37.62], 13);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '&copy; OpenStreetMap'
+}).addTo(map);
+
+let mode = 'pan', rect = null, start = null, leds = [];
+
+function setMode(m) {
+  mode = m;
+  for (const [id, v] of [['mPan', 'pan'], ['mArea', 'area'], ['mLed', 'led']]) $(id).classList.toggle('on', v === m);
+  if (m === 'area') map.dragging.disable(); else map.dragging.enable();
+  map.getContainer().style.cursor = m === 'pan' ? '' : 'crosshair';
+}
+$('mPan').onclick = () => setMode('pan');
+$('mArea').onclick = () => setMode('area');
+$('mLed').onclick = () => setMode('led');
+
+function updateInfo() {
+  if (!rect) { $('info').textContent = ''; return; }
+  const b = rect.getBounds();
+  const wm = map.distance(b.getSouthWest(), b.getSouthEast());
+  const hm = map.distance(b.getSouthWest(), b.getNorthWest());
+  const wmm = +$('w').value || 400;
+  $('info').textContent = `${(wm / 1000).toFixed(2)}×${(hm / 1000).toFixed(2)} км → ` +
+    `${wmm}×${Math.round(wmm * hm / wm)} мм, 1:${Math.round(wm * 1000 / wmm)} · LED: ${leds.length}`;
+}
+$('w').oninput = updateInfo;
+
+map.on('mousedown', e => {
+  if (mode !== 'area') return;
+  start = e.latlng;
+  if (rect) map.removeLayer(rect);
+  rect = L.rectangle([start, start], {color: '#e33', weight: 2}).addTo(map);
+});
+map.on('mousemove', e => { if (start) { rect.setBounds([start, e.latlng]); updateInfo(); } });
+document.addEventListener('mouseup', () => { start = null; });
+
+map.on('click', e => {
+  if (mode !== 'led') return;
+  const m = L.circleMarker(e.latlng, {radius: 6, color: '#c80', fillColor: '#fc0', fillOpacity: 1}).addTo(map);
+  leds.push(m);
+  m.on('click', ev => {
+    L.DomEvent.stop(ev);
+    if (mode !== 'led') return;
+    map.removeLayer(m);
+    leds = leds.filter(x => x !== m);
+    updateInfo();
+  });
+  updateInfo();
+});
+
+function status(text, err) { $('st').textContent = text; $('st').className = err ? 'err' : ''; }
+
+$('go').onclick = async () => {
+  if (!rect) { status('Сначала выдели область (кнопка «Область»)', true); return; }
+  const b = rect.getBounds();
+  status('Собираю… это может занять минуту');
+  $('go').disabled = true;
+  try {
+    const r = await fetch('/build', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        bbox: [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()],
+        width_mm: +$('w').value, bed_mm: +$('bed').value,
+        leds: leds.map(m => [m.getLatLng().lat, m.getLatLng().lng])
+      })
+    });
+    if (!r.ok) {
+      let msg = r.status;
+      try { const j = await r.json(); msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); } catch (_) {}
+      status('Ошибка: ' + msg, true);
+      return;
+    }
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'city_map.zip'; a.click();
+    status('Готово, кусков: ' + r.headers.get('X-Pieces') + ' (схема сборки — layout.svg в архиве)');
+  } catch (e) {
+    status('Ошибка: ' + e, true);
+  } finally {
+    $('go').disabled = false;
+  }
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+shapely>=2.0
+trimesh>=4.0
+pyproj>=3.4
+requests
+networkx
+scipy
+rtree
+mapbox_earcut
+manifold3d>=2.4
+fastapi
+uvicorn
