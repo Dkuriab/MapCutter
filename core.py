@@ -43,7 +43,12 @@ LED_SHIFT = 4.0
 
 BED_MARGIN = DT_DEPTH + 3  # tabs stick out of the piece, keep room for them
 
-MAX_AREA_KM2 = 60
+MAX_AREA_KM2 = 2000  # sanity cap; downloads are split into tiles anyway
+
+# --- printability at small scales ---
+MIN_ROAD_MM = 0.6    # every road / river is at least this wide in the model
+DROP_MINOR_MM = 0.25  # minor classes narrower than this in reality-scale are dropped
+MINOR_ROADS = {"service", "living_street", "pedestrian"}
 
 
 class BuildError(Exception):
@@ -82,7 +87,13 @@ def _relation_polygon(el):
     return poly if not poly.is_empty else None
 
 
-def build_layers(elements, bbox_ll, proj):
+def build_layers(elements, bbox_ll, proj, k=None, log=print):
+    """k: model mm per metre. When given, roads and rivers are widened to
+    MIN_ROAD_MM and minor classes that would be thinner than DROP_MINOR_MM are
+    dropped, so a big area at a small scale stays printable."""
+    min_w = MIN_ROAD_MM / k if k else 0
+    drop = (lambda w: w * k < DROP_MINOR_MM) if k else (lambda w: False)
+    dropped = set()
     roads, cut_lines, water = [], [], []
     for el in elements:
         tags = el.get("tags", {})
@@ -103,16 +114,25 @@ def build_layers(elements, bbox_ll, proj):
             hw = hw[:-5]
         ww = tags.get("waterway")
         if hw in ROAD_WIDTH:
-            roads.append(line.buffer(ROAD_WIDTH[hw] / 2, cap_style=2))
+            if hw in MINOR_ROADS and drop(ROAD_WIDTH[hw]):
+                dropped.add(hw)
+                continue
+            roads.append(line.buffer(max(ROAD_WIDTH[hw], min_w) / 2, cap_style=2))
             if hw in CUT_ROADS:
                 cut_lines.append(line)
         elif ww in RIVER_WIDTH:
-            water.append(line.buffer(RIVER_WIDTH[ww] / 2))
+            if ww == "stream" and drop(RIVER_WIDTH[ww]):
+                dropped.add(ww)
+                continue
+            water.append(line.buffer(max(RIVER_WIDTH[ww], min_w) / 2))
             if ww != "stream":
                 cut_lines.append(line)
         elif tags.get("natural") == "water" or ww == "riverbank":
             if len(pts) >= 4 and pts[0] == pts[-1]:
                 water.append(proj(Polygon(pts)).buffer(0))
+    if dropped:
+        log(f"Мелкий масштаб: убраны {', '.join(sorted(dropped))}; "
+            f"остальные дороги не тоньше {MIN_ROAD_MM} мм")
     area = proj(box(*bbox_ll))
     water_u = unary_union(water).intersection(area) if water else Polygon()
     roads_u = unary_union(roads).intersection(area).difference(water_u) if roads else Polygon()
@@ -384,9 +404,9 @@ def layout_svg(area, pieces, water, leds):
 def build_from_elements(elements, bbox_ll, model_width_mm, leds_ll=(), bed=256, log=print):
     west, south, east, north = bbox_ll
     proj = make_projector((south + north) / 2, (west + east) / 2)
-    area, roads, water, blocks, cuts = build_layers(elements, bbox_ll, proj)
-    minx, miny, maxx, maxy = area.bounds
+    minx, miny, maxx, maxy = proj(box(*bbox_ll)).bounds
     k = model_width_mm / (maxx - minx)
+    area, roads, water, blocks, cuts = build_layers(elements, bbox_ll, proj, k, log)
     o = (minx, miny)
     area, roads, water, blocks = (to_model(g, o, k) for g in (area, roads, water, blocks))
     cuts = [to_model(c, o, k) for c in cuts]

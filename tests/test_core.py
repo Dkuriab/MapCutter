@@ -85,19 +85,20 @@ def to_osm_xml(elements):
     out = ['<?xml version="1.0" encoding="UTF-8"?>', '<osm version="0.6">']
     nid, wid = [0], [0]
     nodes, ways, rels = [], [], []
-    def add_way(geom, tags):
+    def add_way(geom, tags, real_id=None):
         refs = []
-        for p in geom:
+        for k, p in enumerate(geom):
             nid[0] += 1
-            nodes.append(f'<node id="{nid[0]}" lat="{p["lat"]}" lon="{p["lon"]}"/>')
-            refs.append(nid[0])
-        wid[0] += 1
+            node_id = real_id * 100000 + k if real_id else nid[0]
+            nodes.append(f'<node id="{node_id}" lat="{p["lat"]}" lon="{p["lon"]}"/>')
+            refs.append(node_id)
+        wid[0] = real_id or wid[0] + 1
         t = "".join(f'<tag k="{k}" v="{v}"/>' for k, v in tags.items())
         ways.append(f'<way id="{wid[0]}">' + "".join(f'<nd ref="{r}"/>' for r in refs) + t + "</way>")
         return wid[0]
     for el in elements:
         if el["type"] == "way":
-            add_way(el["geometry"], el["tags"])
+            add_way(el["geometry"], el["tags"], el.get("id"))
         else:
             mem = [(add_way(m["geometry"], {}), m["role"]) for m in el["members"]]
             t = "".join(f'<tag k="{k}" v="{v}"/>' for k, v in el["tags"].items())
@@ -154,7 +155,9 @@ def test_fallbacks():
     try:
         els = osm_source.fetch_online(*[BBOX[1], BBOX[0], BBOX[3], BBOX[2]], log=lambda *a: None)
         assert len(els) == len(synthetic())
-        assert len(calls) == len(osm_source.OVERPASS_URLS) + 1
+        posts = [c for c in calls if c in osm_source.OVERPASS_URLS]
+        assert len(posts) == len(osm_source.OVERPASS_URLS)  # 400 is not retried in smaller parts
+        assert len(calls) > len(posts)                      # then the main OSM API
         # all sources down -> readable error with the server text and a hint about files
         requests.get = lambda url, **k: R(509, "Bandwidth exceeded")
         try:

@@ -8,6 +8,7 @@ All sources return a list of elements in the Overpass `out geom` shape:
 Order of online attempts: several Overpass servers, then the main OSM API.
 Offline: a local .osm (XML) or .osm.pbf file.
 """
+import math
 import re
 import xml.etree.ElementTree as ET
 
@@ -20,7 +21,10 @@ OVERPASS_URLS = [
     "https://overpass.kumi.systems/api/interpreter",
 ]
 OSM_API = "https://api.openstreetmap.org/api/0.6/map"
-OSM_API_MAX_DEG2 = 0.25  # main API refuses bigger boxes
+OSM_API_TILE_DEG = 0.02     # main API: max 0.25 deg² and 50 000 nodes per call
+OSM_API_MAX_REQUESTS = 100  # be polite; beyond that use a file
+OVERPASS_TILE_DEG = 0.1     # ~11 × 6 km in mid latitudes
+OVERPASS_MIN_TILE_DEG = 0.025
 USER_AGENT = "CityMap3D/1.0 (personal 3D-print utility; +https://github.com/dkuriab/mapcutter)"
 
 ROAD_CLASSES = {
@@ -32,7 +36,9 @@ WATERWAYS = {"river", "canal", "stream", "riverbank"}
 
 
 class SourceError(Exception):
-    pass
+    def __init__(self, msg, too_big=False):
+        super().__init__(msg)
+        self.too_big = too_big  # a smaller area might work
 
 
 def wanted(tags):
@@ -77,51 +83,125 @@ def overpass_query(south, west, north, east):
     )
 
 
+def split_bbox(south, west, north, east, step):
+    nx = max(1, math.ceil((east - west) / step - 1e-9))
+    ny = max(1, math.ceil((north - south) / step - 1e-9))
+    dx, dy = (east - west) / nx, (north - south) / ny
+    return [(south + j * dy, west + i * dx, south + (j + 1) * dy, west + (i + 1) * dx)
+            for j in range(ny) for i in range(nx)]
+
+
+def quarters(t):
+    s, w, n, e = t
+    ms, mw = (s + n) / 2, (w + e) / 2
+    return [(s, w, ms, mw), (s, mw, ms, e), (ms, w, n, mw), (ms, mw, n, e)]
+
+
+def merge_elements(chunks):
+    """Tiles overlap at the edges: keep each OSM object once."""
+    seen, out = set(), []
+    for chunk in chunks:
+        for el in chunk:
+            key = (el.get("type"), el.get("id"))
+            if key[1] is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            out.append(el)
+    return out
+
+
 def fetch_overpass(south, west, north, east, log=print):
-    q = overpass_query(south, west, north, east)
-    errors = []
-    for url in OVERPASS_URLS:
-        host = url.split("/")[2]
+    """Big areas are downloaded tile by tile; a tile that times out is split in four."""
+    servers = list(OVERPASS_URLS)
+    tiles = split_bbox(south, west, north, east, OVERPASS_TILE_DEG)
+    chunks, done = [], 0
+
+    def one(tile):
+        q = overpass_query(*tile)
+        errs, too_big = [], False
+        for url in list(servers):
+            host = url.split("/")[2]
+            try:
+                r = requests.post(url, data={"data": q}, timeout=200,
+                                  headers={"User-Agent": USER_AGENT})
+                if r.status_code != 200:
+                    raise SourceError(f"HTTP {r.status_code}: {_short(r.text)}",
+                                      too_big=r.status_code in (504,))
+                data = r.json()
+                remark = data.get("remark", "")
+                if "runtime error" in remark:  # timeout / out of memory on the server
+                    raise SourceError(_short(remark), too_big=True)
+                # the server that answered goes first next time
+                servers.remove(url)
+                servers.insert(0, url)
+                return data["elements"]
+            except Exception as e:
+                log(f"  {host}: {e}")
+                errs.append(f"{host}: {e}")
+                too_big |= getattr(e, "too_big", False) or isinstance(e, requests.Timeout)
+        raise SourceError("; ".join(errs), too_big=too_big)
+
+    queue = list(tiles)
+    while queue:
+        tile = queue.pop(0)
+        done += 1
+        if len(tiles) > 1:
+            log(f"Overpass: часть {done} из {done + len(queue)}…")
+        else:
+            log("Overpass…")
         try:
-            log(f"Overpass: {host}…")
-            r = requests.post(url, data={"data": q}, timeout=180,
-                              headers={"User-Agent": USER_AGENT})
-            if r.status_code != 200:
-                raise SourceError(f"HTTP {r.status_code}: {_short(r.text)}")
-            return r.json()["elements"]
-        except Exception as e:
-            log(f"  {host}: {e}")
-            errors.append(f"{host}: {e}")
-    raise SourceError("; ".join(errors))
+            chunks.append(one(tile))
+        except SourceError as e:
+            if e.too_big and tile[2] - tile[0] > OVERPASS_MIN_TILE_DEG:
+                log("  не вышло, делю этот кусок на 4 части")
+                queue[:0] = quarters(tile)
+                continue
+            raise SourceError(str(e))
+    return merge_elements(chunks)
 
 
 # ---------------------------------------------------------------- main OSM API
 
 def fetch_osm_api(south, west, north, east, log=print):
-    if (east - west) * (north - south) > OSM_API_MAX_DEG2:
-        raise SourceError("область слишком большая для основного API OSM")
-    log("Основной API OpenStreetMap…")
-    r = requests.get(OSM_API, params={"bbox": f"{west},{south},{east},{north}"},
-                     timeout=180, headers={"User-Agent": USER_AGENT})
-    if r.status_code != 200:
-        raise SourceError(f"OSM API HTTP {r.status_code}: {_short(r.text)}")
-    return parse_osm_xml(r.content)
+    """Main OSM API returns everything (buildings too), so tiles must be small.
+    A tile with too many nodes (HTTP 400) is split in four."""
+    queue = split_bbox(south, west, north, east, OSM_API_TILE_DEG)
+    if len(queue) > OSM_API_MAX_REQUESTS:
+        raise SourceError(f"область слишком большая для основного API OSM "
+                          f"({len(queue)} запросов, максимум {OSM_API_MAX_REQUESTS})")
+    chunks, calls = [], 0
+    while queue:
+        s, w, n, e = queue.pop(0)
+        calls += 1
+        if calls > OSM_API_MAX_REQUESTS:
+            raise SourceError("слишком много запросов к основному API OSM")
+        log(f"Основной API OpenStreetMap: часть {calls} из {calls + len(queue)}…")
+        r = requests.get(OSM_API, params={"bbox": f"{w:.7f},{s:.7f},{e:.7f},{n:.7f}"},
+                         timeout=180, headers={"User-Agent": USER_AGENT})
+        if r.status_code == 400 and n - s > OSM_API_TILE_DEG / 8:
+            queue[:0] = quarters((s, w, n, e))
+            continue
+        if r.status_code != 200:
+            raise SourceError(f"OSM API HTTP {r.status_code}: {_short(r.text)}")
+        chunks.append(parse_osm_xml(r.content))
+    return merge_elements(chunks)
 
 
 # ---------------------------------------------------------------- files
 
 def _assemble(nodes, ways, relations):
-    """nodes: id->(lon,lat); ways: id->(node ids, tags); relations: list of (members, tags)."""
+    """nodes: id->(lon,lat); ways: id->(node ids, tags); relations: list of (id, members, tags)."""
     def geom(nids):
         return [{"lon": nodes[i][0], "lat": nodes[i][1]} for i in nids if i in nodes]
 
     out = []
-    for nids, tags in ways.values():
+    for wid, (nids, tags) in ways.items():
         if wanted(tags):
             g = geom(nids)
             if len(g) >= 2:
-                out.append({"type": "way", "tags": tags, "geometry": g})
-    for members, tags in relations:
+                out.append({"type": "way", "id": wid, "tags": tags, "geometry": g})
+    for rid, members, tags in relations:
         if tags.get("natural") == "water" or tags.get("waterway") == "riverbank":
             ms = []
             for ref, role in members:
@@ -130,7 +210,7 @@ def _assemble(nodes, ways, relations):
                     if len(g) >= 2:
                         ms.append({"type": "way", "role": role, "geometry": g})
             if ms:
-                out.append({"type": "relation", "tags": tags, "members": ms})
+                out.append({"type": "relation", "id": rid, "tags": tags, "members": ms})
     return out
 
 
@@ -151,7 +231,7 @@ def parse_osm_xml(data):
             tags = {t.get("k"): t.get("v") for t in el.iter("tag")}
             members = [(m.get("ref"), m.get("role") or "outer")
                        for m in el.iter("member") if m.get("type") == "way"]
-            relations.append((members, tags))
+            relations.append((el.get("id"), members, tags))
     return _assemble(nodes, ways, relations)
 
 
@@ -177,7 +257,7 @@ def parse_osm_pbf(path, bbox=None):
             tags = {t.k: t.v for t in r.tags}
             if tags.get("natural") == "water" or tags.get("waterway") == "riverbank":
                 members = [(str(m.ref), m.role or "outer") for m in r.members if m.type == "w"]
-                self.relations.append((members, tags))
+                self.relations.append((str(r.id), members, tags))
                 self.member_ids.update(ref for ref, _ in members)
 
     class H(osmium.SimpleHandler):

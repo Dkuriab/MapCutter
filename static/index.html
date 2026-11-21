@@ -60,7 +60,9 @@ function updateInfo() {
   const wm = map.distance(b.getSouthWest(), b.getSouthEast());
   const hm = map.distance(b.getSouthWest(), b.getNorthWest());
   const wmm = +$('w').value || 400;
-  $('info').textContent = `${(wm / 1000).toFixed(2)}×${(hm / 1000).toFixed(2)} км → ` +
+  const km2 = wm * hm / 1e6;
+  $('info').style.color = km2 > 2000 ? '#c22' : '';
+  $('info').textContent = `${(wm / 1000).toFixed(2)}×${(hm / 1000).toFixed(2)} км (${km2.toFixed(0)} км²) → ` +
     `${wmm}×${Math.round(wmm * hm / wm)} мм, 1:${Math.round(wm * 1000 / wmm)} · LED: ${leds.length}`;
 }
 $('w').oninput = updateInfo;
