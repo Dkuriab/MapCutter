@@ -68,9 +68,9 @@ def _short(text, n=300):
 
 # ---------------------------------------------------------------- Overpass
 
-def overpass_query(south, west, north, east):
+def overpass_query(south, west, north, east, roads=None):
     bb = f"({south:.7f},{west:.7f},{north:.7f},{east:.7f})"
-    hw = "|".join(sorted(ROAD_CLASSES))
+    hw = "|".join(sorted(roads or ROAD_CLASSES))
     ww = "|".join(sorted(WATERWAYS))
     return (
         "[out:json][timeout:120];\n(\n"
@@ -111,14 +111,14 @@ def merge_elements(chunks):
     return out
 
 
-def fetch_overpass(south, west, north, east, log=print):
+def fetch_overpass(south, west, north, east, log=print, roads=None):
     """Big areas are downloaded tile by tile; a tile that times out is split in four."""
     servers = list(OVERPASS_URLS)
     tiles = split_bbox(south, west, north, east, OVERPASS_TILE_DEG)
     chunks, done = [], 0
 
     def one(tile):
-        q = overpass_query(*tile)
+        q = overpass_query(*tile, roads=roads)
         errs, too_big = [], False
         for url in list(servers):
             host = url.split("/")[2]
@@ -306,10 +306,11 @@ def load_file(path, bbox=None):
 
 # ---------------------------------------------------------------- all online sources
 
-def fetch_online(south, west, north, east, log=print):
+def fetch_online(south, west, north, east, log=print, roads=None):
+    """roads: highway classes to ask Overpass for (fewer = faster)."""
     errors = []
     try:
-        return fetch_overpass(south, west, north, east, log)
+        return fetch_overpass(south, west, north, east, log, roads)
     except SourceError as e:
         errors.append(f"Overpass — {e}")
     try:

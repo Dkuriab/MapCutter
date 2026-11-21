@@ -20,6 +20,8 @@ class Job(BaseModel):
     width_mm: float = Field(400, gt=50, le=3000)
     bed_mm: float = Field(256, ge=100, le=1000)
     leds: List[List[float]] = []  # [[lat, lon], ...]
+    detail: str = Field("low", pattern="^(low|medium|high)$")
+    corner_mm: Optional[float] = Field(None, ge=0, le=10)  # None = preset default
 
 
 @app.get("/")
@@ -42,7 +44,8 @@ def build(job: str = Form(...), osm: Optional[UploadFile] = File(None)):
             osm_path = Path(tmpdir) / Path(osm.filename).name
             with open(osm_path, "wb") as f:
                 shutil.copyfileobj(osm.file, f)
-        data, n = core.run(j.bbox, j.width_mm, j.leds, bed=j.bed_mm, osm_file=osm_path, log=print)
+        data, n = core.run(j.bbox, j.width_mm, j.leds, bed=j.bed_mm, osm_file=osm_path, log=print,
+                           detail=j.detail, corner_mm=j.corner_mm)
     except core.BuildError as e:
         raise HTTPException(400, str(e))
     except Exception as e:

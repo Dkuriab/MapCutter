@@ -27,6 +27,13 @@
   <span class="sep"></span>
   <label>Ширина модели, мм <input id="w" type="number" value="400" min="50"></label>
   <label>Стол, мм <input id="bed" type="number" value="256" min="100"></label>
+  <label title="Низкая — только крупные улицы и реки, контуры упрощены">Детализация
+    <select id="detail">
+      <option value="low" selected>низкая</option>
+      <option value="medium">средняя</option>
+      <option value="high">высокая</option>
+    </select></label>
+  <label title="Радиус скругления углов кварталов">Скругление, мм <input id="corner" type="number" value="1.5" min="0" max="10" step="0.5" style="width:52px"></label>
   <label title="Если онлайн-загрузка не работает: .osm (кнопка «Экспорт» на openstreetmap.org) или .osm.pbf (download.geofabrik.de)">Файл карты
     <input id="osm" type="file" accept=".osm,.pbf,.bz2,.xml" style="width:190px"></label>
   <button id="go">Собрать STL</button>
@@ -66,6 +73,9 @@ function updateInfo() {
     `${wmm}×${Math.round(wmm * hm / wm)} мм, 1:${Math.round(wm * 1000 / wmm)} · LED: ${leds.length}`;
 }
 $('w').oninput = updateInfo;
+// each level has its own default radius; the field follows until edited by hand
+const CORNER = {low: 1.5, medium: 1.0, high: 0.5};
+$('detail').onchange = () => { $('corner').value = CORNER[$('detail').value]; };
 
 map.on('mousedown', e => {
   if (mode !== 'area') return;
@@ -104,6 +114,7 @@ $('go').onclick = async () => {
     fd.append('job', JSON.stringify({
       bbox: [west, b.getSouth(), east, b.getNorth()],
       width_mm: +$('w').value, bed_mm: +$('bed').value,
+      detail: $('detail').value, corner_mm: $('corner').value === '' ? null : +$('corner').value,
       leds: leds.map(m => [m.getLatLng().lat, wrap(m.getLatLng().lng)])
     }));
     if ($('osm').files[0]) fd.append('osm', $('osm').files[0]);

@@ -20,6 +20,8 @@ ROAD_WIDTH = {
 }
 # the model is allowed to be cut along these lines
 CUT_ROADS = {"motorway", "trunk", "primary", "secondary"}
+# extra seams tried when the main ones are too far apart for the bed
+CUT_ROADS_EXTRA = {"tertiary"}
 RIVER_WIDTH = {"river": 30, "canal": 15, "stream": 4}
 
 # --- model dimensions, mm ---
@@ -50,6 +52,34 @@ MIN_ROAD_MM = 0.6    # every road / river is at least this wide in the model
 DROP_MINOR_MM = 0.25  # minor classes narrower than this in reality-scale are dropped
 MINOR_ROADS = {"service", "living_street", "pedestrian"}
 
+# --- level of detail ---
+# roads/waterways: what is kept; simplify: contour tolerance, mm;
+# min_road: narrowest road in the model, mm; min_block / min_water: smaller
+# blocks and ponds are dropped, mm²; corner: block corner radius, mm
+DETAIL = {
+    "low": dict(
+        roads={"motorway", "trunk", "primary", "secondary", "tertiary"},
+        waterways={"river", "canal"},
+        simplify=0.4, min_road=0.8, min_block=12, min_water=12, corner=1.5),
+    "medium": dict(
+        roads={"motorway", "trunk", "primary", "secondary", "tertiary", "residential", "unclassified"},
+        waterways={"river", "canal"},
+        simplify=0.2, min_road=0.6, min_block=4, min_water=4, corner=1.0),
+    "high": dict(
+        roads=set(ROAD_WIDTH), waterways=set(RIVER_WIDTH),
+        simplify=0.05, min_road=0.6, min_block=1, min_water=1, corner=0.5),
+}
+OUTER_CORNER_MM = 6.0  # radius of the four outer corners of the whole map
+
+
+def detail_preset(detail, corner_mm=None):
+    if detail not in DETAIL:
+        raise BuildError(f"Детализация должна быть одной из: {', '.join(DETAIL)}")
+    d = dict(DETAIL[detail])
+    if corner_mm is not None:
+        d["corner"] = max(0.0, float(corner_mm))
+    return d
+
 
 class BuildError(Exception):
     pass
@@ -57,9 +87,9 @@ class BuildError(Exception):
 
 # ---------------------------------------------------------------- OSM
 
-def fetch_osm(south, west, north, east, log=print):
+def fetch_osm(south, west, north, east, log=print, roads=None):
     try:
-        return osm_source.fetch_online(south, west, north, east, log)
+        return osm_source.fetch_online(south, west, north, east, log, roads)
     except osm_source.SourceError as e:
         raise BuildError(str(e))
 
@@ -87,14 +117,16 @@ def _relation_polygon(el):
     return poly if not poly.is_empty else None
 
 
-def build_layers(elements, bbox_ll, proj, k=None, log=print):
+def build_layers(elements, bbox_ll, proj, k=None, log=print, preset=None):
     """k: model mm per metre. When given, roads and rivers are widened to
     MIN_ROAD_MM and minor classes that would be thinner than DROP_MINOR_MM are
     dropped, so a big area at a small scale stays printable."""
-    min_w = MIN_ROAD_MM / k if k else 0
+    preset = preset or DETAIL["high"]
+    keep_roads, keep_ww = preset["roads"], preset["waterways"]
+    min_w = preset["min_road"] / k if k else 0
     drop = (lambda w: w * k < DROP_MINOR_MM) if k else (lambda w: False)
     dropped = set()
-    roads, cut_lines, water = [], [], []
+    roads, cut_lines, extra_cuts, water = [], [], [], []
     for el in elements:
         tags = el.get("tags", {})
         if el.get("type") == "relation":
@@ -113,6 +145,10 @@ def build_layers(elements, bbox_ll, proj, k=None, log=print):
         if hw and hw.endswith("_link"):
             hw = hw[:-5]
         ww = tags.get("waterway")
+        if hw in ROAD_WIDTH and hw not in keep_roads:
+            continue
+        if ww in RIVER_WIDTH and ww not in keep_ww:
+            continue
         if hw in ROAD_WIDTH:
             if hw in MINOR_ROADS and drop(ROAD_WIDTH[hw]):
                 dropped.add(hw)
@@ -120,6 +156,8 @@ def build_layers(elements, bbox_ll, proj, k=None, log=print):
             roads.append(line.buffer(max(ROAD_WIDTH[hw], min_w) / 2, cap_style=2))
             if hw in CUT_ROADS:
                 cut_lines.append(line)
+            elif hw in CUT_ROADS_EXTRA:
+                extra_cuts.append(line)
         elif ww in RIVER_WIDTH:
             if ww == "stream" and drop(RIVER_WIDTH[ww]):
                 dropped.add(ww)
@@ -132,12 +170,12 @@ def build_layers(elements, bbox_ll, proj, k=None, log=print):
                 water.append(proj(Polygon(pts)).buffer(0))
     if dropped:
         log(f"Мелкий масштаб: убраны {', '.join(sorted(dropped))}; "
-            f"остальные дороги не тоньше {MIN_ROAD_MM} мм")
+            f"остальные дороги не тоньше {preset['min_road']} мм")
     area = proj(box(*bbox_ll))
     water_u = unary_union(water).intersection(area) if water else Polygon()
     roads_u = unary_union(roads).intersection(area).difference(water_u) if roads else Polygon()
     blocks = area.difference(roads_u).difference(water_u)
-    return area, roads_u, water_u, blocks, cut_lines
+    return area, roads_u, water_u, blocks, cut_lines, extra_cuts
 
 
 # ---------------------------------------------------------------- geometry helpers
@@ -178,21 +216,20 @@ def fits(poly, bed, margin=BED_MARGIN):
 
 
 def split_straight(poly, bed):
-    # fallback: halve along the long side until it fits
+    """Fallback for a cell bigger than the bed: an even grid of straight cuts,
+    as few as possible (halving would leave pieces only half the bed wide)."""
     if fits(poly, bed):
         return [poly]
+    limit = bed - 2 * BED_MARGIN
     minx, miny, maxx, maxy = poly.bounds
-    if maxx - minx >= maxy - miny:
-        mid = (minx + maxx) / 2
-        halves = [box(minx, miny, mid, maxy), box(mid, miny, maxx, maxy)]
-    else:
-        mid = (miny + maxy) / 2
-        halves = [box(minx, miny, maxx, mid), box(minx, mid, maxx, maxy)]
+    nx = max(1, math.ceil((maxx - minx) / limit))
+    ny = max(1, math.ceil((maxy - miny) / limit))
+    dx, dy = (maxx - minx) / nx, (maxy - miny) / ny
     out = []
-    for h in halves:
-        for p in polys(poly.intersection(h)):
-            if p.area > 1:
-                out += split_straight(p, bed)
+    for i in range(nx):
+        for j in range(ny):
+            cell = box(minx + i * dx, miny + j * dy, minx + (i + 1) * dx, miny + (j + 1) * dy)
+            out += [p for p in polys(poly.intersection(cell)) if p.area > 1]
     return out
 
 
@@ -366,6 +403,30 @@ def led_cutters(points):
     return holes
 
 
+def stl_bytes(mesh):
+    """Write STL the way a slicer will read it: float32 vertices, welded.
+    Thin sliver triangles from the booleans can collapse to zero area in
+    float32 and leave non-manifold edges; only then drop exactly those."""
+    import numpy as np
+    m = trimesh.Trimesh(vertices=mesh.vertices.astype(np.float32).astype(np.float64),
+                        faces=mesh.faces, process=True)
+    if not m.is_watertight:
+        fixed = m.copy()
+        fixed.update_faces(fixed.area_faces > 1e-9)
+        fixed.update_faces(fixed.unique_faces())
+        fixed.remove_unreferenced_vertices()
+        if fixed.is_watertight:
+            m = fixed
+        else:
+            try:  # let manifold rebuild it
+                rebuilt = trimesh.boolean.union([fixed], engine="manifold", check_volume=False)
+                if len(rebuilt.faces) and rebuilt.is_watertight:
+                    m = rebuilt
+            except Exception:
+                pass
+    return m.export(file_type="stl"), m
+
+
 def print_pose(piece):
     """Rotation angle (deg) and offset that put the piece flat in the bed corner."""
     r = piece.minimum_rotated_rectangle
@@ -401,22 +462,56 @@ def layout_svg(area, pieces, water, leds):
 
 # ---------------------------------------------------------------- pipeline
 
-def build_from_elements(elements, bbox_ll, model_width_mm, leds_ll=(), bed=256, log=print):
+def round_corners(geom, r, min_area=0):
+    """Opening with round joins: convex corners get radius r, slivers vanish."""
+    if r > 0:
+        geom = geom.buffer(-r, quad_segs=4).buffer(r, quad_segs=4)
+    if min_area:
+        geom = unary_union([p for p in polys(geom) if p.area >= min_area])
+    return geom
+
+
+def simplify_layers(area, water, blocks, preset, log=print):
+    tol = preset["simplify"]
+    if OUTER_CORNER_MM > 0:
+        area = area.buffer(-OUTER_CORNER_MM, join_style=2).buffer(OUTER_CORNER_MM, quad_segs=8)
+    water = water.simplify(tol).buffer(0).intersection(area)
+    water = unary_union([p for p in polys(water) if p.area >= preset["min_water"]])
+    blocks = blocks.simplify(tol).buffer(0)
+    blocks = round_corners(blocks, preset["corner"], preset["min_block"]).intersection(area)
+    blocks = blocks.difference(water)
+    log(f"Детализация: упрощение {tol} мм, скругление углов {preset['corner']} мм")
+    return area, water, blocks
+
+
+def build_from_elements(elements, bbox_ll, model_width_mm, leds_ll=(), bed=256, log=print,
+                        detail="low", corner_mm=None):
     west, south, east, north = bbox_ll
     proj = make_projector((south + north) / 2, (west + east) / 2)
     minx, miny, maxx, maxy = proj(box(*bbox_ll)).bounds
     k = model_width_mm / (maxx - minx)
-    area, roads, water, blocks, cuts = build_layers(elements, bbox_ll, proj, k, log)
+    preset = detail_preset(detail, corner_mm)
+    area, roads, water, blocks, cuts, extra = build_layers(elements, bbox_ll, proj, k, log, preset)
     o = (minx, miny)
     area, roads, water, blocks = (to_model(g, o, k) for g in (area, roads, water, blocks))
+    area, water, blocks = simplify_layers(area, water, blocks, preset, log)
     cuts = [to_model(c, o, k) for c in cuts]
+    extra = [to_model(c, o, k) for c in extra]
     leds = [to_model(proj(Point(lon, lat)), o, k) for lat, lon in leds_ll]
     leds = [(p.x, p.y) for p in leds]
     log(f"Модель {maxx - minx:.0f}×{maxy - miny:.0f} м → "
         f"{area.bounds[2]:.0f}×{area.bounds[3]:.0f} мм, масштаб 1:{1000 / k:.0f}")
 
+    # seams along big streets and rivers only, or also along tertiary streets:
+    # whichever gives fewer pieces (main seams win a tie)
     cells = make_cells(area, cuts, bed)
     pieces = merge_cells(cells, bed)
+    if extra:
+        cells2 = make_cells(area, cuts + extra, bed)
+        pieces2 = merge_cells(cells2, bed)
+        if len(pieces2) < len(pieces):
+            log(f"Швы и по улицам поменьше: {len(pieces2)} кусков вместо {len(pieces)}")
+            cells, pieces = cells2, pieces2
     log(f"Ячеек {len(cells)}, кусков {len(pieces)}")
     tabs, sockets = seam_joints(pieces, water)
     log(f"Замков: {sum(len(t) for t in tabs)}")
@@ -435,13 +530,14 @@ def build_from_elements(elements, bbox_ll, model_width_mm, leds_ll=(), bed=256, 
             m.apply_transform(trimesh.transformations.rotation_matrix(
                 math.radians(print_pose(pc)), (0, 0, 1)))
             m.apply_translation(-m.bounds[0])
+            data_stl, m = stl_bytes(m)
             ext = m.extents
             if max(ext[0], ext[1]) > bed:
                 log(f"  ! кусок {i + 1} {ext[0]:.0f}×{ext[1]:.0f} мм больше стола")
             log(f"  piece_{i + 1:02d}: {ext[0]:.0f}×{ext[1]:.0f} мм, "
                 f"замков {len(tabs[i])}+{len(sockets[i])}, LED {len(pts)}, "
                 f"{'ok' if m.is_watertight else 'НЕ watertight'}")
-            z.writestr(f"piece_{i + 1:02d}.stl", m.export(file_type="stl"))
+            z.writestr(f"piece_{i + 1:02d}.stl", data_stl)
             n += 1
         z.writestr("layout.svg", layout_svg(area, pieces, water, leds))
     return buf.getvalue(), n
@@ -457,13 +553,15 @@ def check_bbox(bbox_ll):
         raise BuildError(f"Область {km2:.0f} км² слишком большая (максимум {MAX_AREA_KM2})")
 
 
-def run(bbox_ll, model_width_mm, leds_ll=(), bed=256, log=print, osm_file=None):
+def run(bbox_ll, model_width_mm, leds_ll=(), bed=256, log=print, osm_file=None,
+        detail="low", corner_mm=None):
     """osm_file: optional path to .osm / .osm.bz2 / .osm.pbf instead of downloading."""
     try:
         bbox_ll = osm_source.normalize_bbox(*bbox_ll)
     except osm_source.SourceError as e:
         raise BuildError(str(e))
     check_bbox(bbox_ll)
+    preset = detail_preset(detail, corner_mm)
     west, south, east, north = bbox_ll
     leds_ll = [(lat, osm_source.wrap_lon(lon)) for lat, lon in leds_ll]
     if osm_file:
@@ -474,8 +572,8 @@ def run(bbox_ll, model_width_mm, leds_ll=(), bed=256, log=print, osm_file=None):
             raise BuildError(str(e))
     else:
         log("Скачиваю OSM…")
-        els = fetch_osm(south, west, north, east, log)
+        els = fetch_osm(south, west, north, east, log, preset["roads"])
     log(f"Объектов OSM: {len(els)}")
     if not els:
         raise BuildError("В этой области нет ни дорог, ни воды — проверь область или файл")
-    return build_from_elements(els, bbox_ll, model_width_mm, leds_ll, bed, log)
+    return build_from_elements(els, bbox_ll, model_width_mm, leds_ll, bed, log, detail, corner_mm)

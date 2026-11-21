@@ -47,6 +47,29 @@ def test_build():
         assert abs(m.extents[2] - (core.BASE_H + core.ROAD_H + core.BLOCK_H)) < 0.05
 
 
+def test_detail_and_corners():
+    from shapely.geometry import box
+    w, s_, e, n = BBOX
+    proj = core.make_projector((s_ + n) / 2, (w + e) / 2)
+    minx, miny, maxx, maxy = proj(box(*BBOX)).bounds
+    k = 500 / (maxx - minx)
+    counts = {}
+    for d in ("low", "high"):
+        pre = core.detail_preset(d)
+        area, roads, water, blocks, cuts, extra = core.build_layers(synthetic(), BBOX, proj, k, lambda *a: None, pre)
+        area, roads, water, blocks = (core.to_model(g, (minx, miny), k) for g in (area, roads, water, blocks))
+        area, water, blocks = core.simplify_layers(area, water, blocks, pre, lambda *a: None)
+        counts[d] = len(core.polys(blocks))
+        # rounded: a block's area is less than its bounding box (sharp rectangles would match)
+        b = max(core.polys(blocks), key=lambda p: p.area)
+        assert b.area < b.envelope.area * 0.999
+    assert counts["low"] < counts["high"]  # residential streets dropped
+    try:
+        core.detail_preset("ultra"); assert False
+    except core.BuildError:
+        pass
+
+
 def test_joints_exist():
     from shapely.geometry import box
     pieces = [box(0, 0, 100, 100), box(100, 0, 200, 100)]
@@ -177,5 +200,5 @@ def test_wrapped_longitude():
 
 
 if __name__ == "__main__":
-    test_joints_exist(); test_build(); test_api(); test_osm_xml_and_pbf()
+    test_detail_and_corners(); test_joints_exist(); test_build(); test_api(); test_osm_xml_and_pbf()
     test_fallbacks(); test_wrapped_longitude(); print("OK")
